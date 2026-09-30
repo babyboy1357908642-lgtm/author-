@@ -2,12 +2,15 @@
 import time
 import re
 import random
+import secrets
 from pymongo import MongoClient, ReturnDocument
 from pymongo.read_concern import ReadConcern
 from pymongo.write_concern import WriteConcern
-from .domain import BOOM_TURN_TIMEOUT_SECONDS, MAX_ACTIVE_PVP_GAMES, MAX_PVP_WAGER, MIN_PVP_WAGER, PVP_REQUEST_TIMEOUT_SECONDS, RuleError, money
+from .domain import BOOM_TURN_TIMEOUT_SECONDS, MAX_ACTIVE_PVP_GAMES, MAX_PVP_WAGER, MIN_PVP_WAGER, PVP_REQUEST_TIMEOUT_SECONDS, PVP_DICE_PAYOUT_RULE, RuleError, money, pvp_dice_outcome
 
 PVP_ANIMATION_INTERVAL_SECONDS = 1.2
+PVP_DICE_ANIMATION_SECONDS = 4
+PVP_DICE_TIMEOUT_SECONDS = 90
 
 
 class MongoStore:
@@ -409,6 +412,8 @@ class MongoStore:
     def create_pvp(self,game_id,group_id,requester_id,requester_name,target_id,target_name,amount,now=None):
         if type(amount) is not int or not MIN_PVP_WAGER<=amount<=MAX_PVP_WAGER:raise RuleError("PvP လောင်းကြေးကို 250 မှ 30000 coin အတွင်းထားပါ။")
         if requester_id==target_id:raise RuleError("ကိုယ့်ကိုယ်ကို PvP request လုပ်လို့မရပါ။")
+        # Pick once before transaction retries, and reveal the assignment before Confirm.
+        low_player_id = secrets.choice((requester_id, target_id))
         def create(s):
             at=time.time() if now is None else now
             if str(group_id)!=str(self.get("pvp_group_id",session=s)):
@@ -423,7 +428,8 @@ class MongoStore:
             self.db.pvp_games.insert_one(dict(_id=game_id,id=game_id,group_id=group_id,requester_id=requester_id,
                 requester_name=requester_name[:64],target_id=target_id,target_name=target_name[:64],amount=amount,
                 status="pending",message_id=0,created=at,next_at=None,step=0,final_percent=None,winner_id=None,
-                slot_notified=0),session=s)
+                slot_notified=0, low_player_id=low_player_id,
+                dice_payout_rule=PVP_DICE_PAYOUT_RULE),session=s)
             return self._pvp_game(game_id,s)
         return self._tx(create)
 
@@ -764,8 +770,8 @@ class MongoStore:
             return expired
         return self._tx(expire)
 
-    def accept_pvp(self,game_id,actor_id,final_percent,now=None):
-        if type(final_percent) is not int or not 1<=final_percent<=100:raise RuleError("PvP result မမှန်ပါ။")
+    def accept_pvp(self,game_id,actor_id,final_percent=None,now=None):
+        if final_percent is not None and (type(final_percent) is not int or not 1<=final_percent<=100):raise RuleError("PvP result မမှန်ပါ။")
         def accept(s):
             at=time.time() if now is None else now
             row=self._pvp_game(game_id,s)
@@ -788,11 +794,58 @@ class MongoStore:
                 eid=self._next("wallet_events",s)
                 self.db.wallet_events.insert_one(dict(_id=eid,id=eid,user_id=uid,delta=-row["amount"],kind="pvp_stake",
                     note=f"PvP stake · {game_id}",actor_id=actor_id,auction_id=None,event_key=f"pvp:{game_id}:stake:{uid}",created=at),session=s)
-            self.db.pvp_games.update_one({"_id":game_id,"status":"pending"},{"$set":{"status":"running","next_at":at+PVP_ANIMATION_INTERVAL_SECONDS,"step":0,"final_percent":final_percent,
-                # Only the third concurrent round can free a slot from a full set of three.
-                "slot_notified": 0 if active_rounds == 2 else 1}},session=s)
+            state = {"status": "running", "next_at": at + PVP_ANIMATION_INTERVAL_SECONDS,
+                     "step": 0, "final_percent": final_percent,
+                     # Only the third concurrent round frees a slot from a full set.
+                     "slot_notified": 0 if active_rounds == 2 else 1}
+            if final_percent is None:
+                state.update(mode="dice", next_at=at, dice_started_at=None,
+                             dice_value=None, dice_message_id=None, result_notified=False)
+            self.db.pvp_games.update_one({"_id":game_id,"status":"pending"},
+                                        {"$set":state},session=s)
             return self._pvp_game(game_id,s)
         return self._tx(accept)
+
+    def claim_pvp_dice(self, game_id, now=None):
+        """Claim one Telegram roll; an uncertain send is refunded, never rerolled."""
+        def claim(s):
+            at = time.time() if now is None else now
+            row = self._pvp_game(game_id, s)
+            if (row["status"] != "running" or row.get("mode") != "dice"
+                    or row.get("dice_started_at") is not None):
+                return None
+            self.db.pvp_games.update_one({"_id": game_id}, {"$set": {
+                "dice_started_at": at, "next_at": at + PVP_DICE_TIMEOUT_SECONDS}}, session=s)
+            return self._pvp_game(game_id, s)
+        return self._tx(claim)
+
+    def record_pvp_dice(self, game_id, value, message_id, now=None):
+        if type(value) is not int or not 1 <= value <= 6 or type(message_id) is not int or message_id <= 0:
+            raise RuleError("PvP အံစာရလဒ် မမှန်ပါ။")
+        def record(s):
+            at = time.time() if now is None else now
+            row = self._pvp_game(game_id, s)
+            if row.get("dice_value") is not None:
+                if (row["dice_value"], row["dice_message_id"]) != (value, message_id):
+                    raise RuleError("ဒီပွဲရဲ့ အံစာရလဒ်ကို ပြောင်းလို့မရပါ။")
+                return row
+            if (row["status"] != "running" or row.get("mode") != "dice"
+                    or row.get("dice_started_at") is None):
+                raise RuleError("ဒီ PvP ပွဲမှာ အံစာရလဒ် သိမ်းလို့မရပါ။")
+            self.db.pvp_games.update_one({"_id": game_id}, {"$set": {
+                "dice_value": value, "dice_message_id": message_id,
+                "next_at": at + PVP_DICE_ANIMATION_SECONDS}}, session=s)
+            return self._pvp_game(game_id, s)
+        return self._tx(record)
+
+    def pending_pvp_dice_results(self):
+        return [self._clean(row) for row in self.db.pvp_games.find({
+            "mode": "dice", "status": {"$in": ["finished", "cancelled"]},
+            "result_notified": False}).sort([("created", 1), ("_id", 1)])]
+
+    def mark_pvp_dice_result(self, game_id):
+        self.db.pvp_games.update_one({"_id": game_id, "mode": "dice",
+            "status": {"$in": ["finished", "cancelled"]}}, {"$set": {"result_notified": True}})
 
     def due_pvp(self,now=None):
         at=time.time() if now is None else now
@@ -803,12 +856,26 @@ class MongoStore:
             at=time.time() if now is None else now
             row=self._pvp_game(game_id,s)
             if row["status"]!="running" or row["next_at"] is None or row["next_at"]>at:return row
-            step=row["step"]+1
+            if row.get("mode") == "dice" and row.get("dice_value") is None:
+                if row.get("dice_started_at") is None:
+                    return row
+                # A lost Telegram response or process crash must not leave stakes locked.
+                for uid in (row["requester_id"], row["target_id"]):
+                    self.db.wallets.update_one({"_id": uid}, {"$inc": {"balance": row["amount"]}}, session=s)
+                    eid = self._next("wallet_events", s)
+                    self.db.wallet_events.insert_one(dict(_id=eid, id=eid, user_id=uid,
+                        delta=row["amount"], kind="pvp_refund", note=f"PvP dice unavailable · {game_id}",
+                        actor_id=None, auction_id=None, event_key=f"pvp:{game_id}:timeout:{uid}",
+                        created=at), session=s)
+                self.db.pvp_games.update_one({"_id": game_id}, {"$set": {
+                    "status": "cancelled", "next_at": None, "slot_notified": 1}}, session=s)
+                return self._pvp_game(game_id, s)
+            step = 2 if row.get("mode") == "dice" else row["step"] + 1
             if step<2:
                 self.db.pvp_games.update_one({"_id":game_id,"status":"running"},{"$set":{"step":step,"next_at":at+PVP_ANIMATION_INTERVAL_SECONDS}},session=s)
                 return self._pvp_game(game_id,s)
             requester_percent = row["final_percent"]
-            target_percent = 100 - requester_percent
+            target_percent = 100 - requester_percent if requester_percent is not None else None
             if row.get("mode") == "solo":
                 won = row.get("choice") == row.get("result")
                 pot = row["amount"] * 2
@@ -839,12 +906,16 @@ class MongoStore:
                     {"$set":{"status":"finished","winner_id":winner,"step":2,"next_at":None,
                               "prize":prize,"refund":refund,"streak":streak["streak"],"streak_reward":streak["reward"]}},session=s)
                 return self._pvp_game(game_id,s)
-            winner = row["requester_id"] if requester_percent > 50 else row["target_id"]
-            loser = row["target_id"] if winner == row["requester_id"] else row["requester_id"]
-            loser_percent = target_percent if winner == row["requester_id"] else requester_percent
             pot = row["amount"] * 2
-            loser_payout = 0 if loser_percent > 25 else pot * loser_percent // 100
-            winner_payout = pot - loser_payout
+            if row.get("mode") == "dice":
+                winner, winner_payout = pvp_dice_outcome(row)
+                loser_payout = 0
+            else:
+                winner = row["requester_id"] if requester_percent > 50 else row["target_id"]
+                loser_percent = target_percent if winner == row["requester_id"] else requester_percent
+                loser_payout = 0 if loser_percent > 25 else pot * loser_percent // 100
+                winner_payout = pot - loser_payout
+            loser = row["target_id"] if winner == row["requester_id"] else row["requester_id"]
             for uid in (winner, loser):
                 if not self.db.wallets.find_one({"_id":uid},session=s):
                     raise RuleError("Winner/loser wallet မတွေ့ပါ။ Owner က စစ်ဆေးရန်လိုပါတယ်။")
@@ -859,8 +930,11 @@ class MongoStore:
                     note=f"PvP refund · {game_id}",actor_id=None,auction_id=None,event_key=f"pvp:{game_id}:refund",created=at),session=s)
             winner_streak=self._record_streak(s,"pvp",row["group_id"],winner,True,at)
             self._record_streak(s,"pvp",row["group_id"],loser,False,at)
-            self.db.pvp_games.update_one({"_id":game_id,"status":"running"},{"$set":{"status":"finished","winner_id":winner,"step":2,"next_at":None,
-                "streak":winner_streak["streak"],"streak_reward":winner_streak["reward"]}},session=s)
+            settled = {"status": "finished", "winner_id": winner, "step": 2, "next_at": None,
+                       "streak": winner_streak["streak"], "streak_reward": winner_streak["reward"]}
+            if row.get("mode") == "dice":
+                settled.update(prize=winner_payout, refund=0, retained=pot-winner_payout)
+            self.db.pvp_games.update_one({"_id":game_id,"status":"running"}, {"$set":settled}, session=s)
             return self._pvp_game(game_id,s)
         return self._tx(advance)
 

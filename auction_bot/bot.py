@@ -10,7 +10,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 
-from telegram import (BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
+from telegram import (ReplyParameters, BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
                       BotCommandScopeChat, MenuButtonCommands, InlineQueryResultCachedPhoto, InlineQueryResultCachedVideo, InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardButton,
                       InlineKeyboardMarkup, MessageOriginChannel)
 from telegram.error import BadRequest, RetryAfter, TelegramError
@@ -19,7 +19,7 @@ from telegram.ext import Application, CallbackQueryHandler, InlineQueryHandler, 
 from . import account, welcome
 from .config import Config
 from .source_export import source_zip
-from .domain import MAX_PVP_WAGER, MIN_PVP_WAGER, USD_TO_COIN_RATE, RuleError, cents, money, usd_to_coins
+from .domain import MAX_PVP_WAGER, MIN_PVP_WAGER, USD_TO_COIN_RATE, PVP_DICE_PAYOUT_RULE, RuleError, cents, money, usd_to_coins, pvp_dice_sides, pvp_dice_outcome
 from .mongo_store import MongoStore
 from pymongo.errors import PyMongoError
 
@@ -181,6 +181,8 @@ def usd_equivalent(coin_subunits):
 
 
 def pvp_payouts(game):
+    if game.get("mode") == "dice":
+        return pvp_dice_outcome(game)[1], 0
     requester_percent = game["final_percent"]
     target_percent = 100 - requester_percent
     winner_id = game["requester_id"] if requester_percent > 50 else game["target_id"]
@@ -190,7 +192,26 @@ def pvp_payouts(game):
     return pot - loser_payout, loser_payout
 
 
+def pvp_dice_matchup(game):
+    low, high = pvp_dice_sides(game)
+    names = {game["requester_id"]: game["requester_name"], game["target_id"]: game["target_name"]}
+    low_color, high_color = ("🟥", "🟩") if game.get("dice_payout_rule") == PVP_DICE_PAYOUT_RULE else ("🟦", "🟥")
+    return (f'{low_color} {pvp_name(low, names[low])} — 1 , 2 , 3\n\n'
+            f'{high_color} {pvp_name(high, names[high])} — 4 , 5 , 6')
+
+
 def pvp_animation_text(game):
+    if game.get("mode") == "dice":
+        text = f'⚔️ <b>PvP · {money(game["amount"])} each</b>\n\n{pvp_dice_matchup(game)}'
+        if game["status"] == "finished":
+            winner_name = game["requester_name"] if game["winner_id"] == game["requester_id"] else game["target_name"]
+            text += (f'\n\n🏆 Winner: {pvp_name(game["winner_id"], winner_name)}'
+                     f'\n🎲Result : {game["dice_value"]}\n🪙 Prize: {money(pvp_payouts(game)[0])}')
+        elif game["status"] == "cancelled":
+            text += f'\n\n❌ အံစာရလဒ် မရသဖြင့် ပွဲပယ်ဖျက်ပြီး တစ်ယောက်စီ {money(game["amount"])} ပြန်အမ်းပြီးပါပြီ။'
+        else:
+            text += "\n\n🎲 အံစာလှိမ့်နေပါတယ်…"
+        return text
     first = game.get("final_percent") if game.get("final_percent") is not None else 50
     if game["status"] == "pending":
         shown = 50
@@ -357,6 +378,7 @@ class AuctionBot:
         self.global_edit_after = 0
         self.pvp_edit_after = 0
         self.pvp_render_retry = {}
+        self.pvp_dice_retry_after = {}
         self.tick_lock = asyncio.Lock()
 
     async def store_call(self, operation, *args, **kwargs):
@@ -739,11 +761,12 @@ class AuctionBot:
             button("✅ Confirm", f"pvp:confirm:{game_id}", "success"),
             button("❌ Cancel", f"pvp:cancel:{game_id}", "danger"),
         ]])
-        text = (f'⚔️ PvP စိန်ခေါ်မှု\n\n{pvp_name(user.id,user.full_name)}\n'
-                f'🪙 လောင်းကြေး: <b>{money(amount)}</b> တစ်ယောက်စီ\n'
-                f'ပြိုင်ဘက်: {pvp_name(target.id,target.full_name)}\n\n'
-                f'{pvp_name(target.id,target.full_name)} က Confirm Waiting။ 15sec အတွင်း မနှိပ်ပါက ပွဲပယ်ပါမယ်။ '
-                '___________________________')
+        text = (f'⚔️ PvP စိန်ခေါ်မှု\n\n🪙 လောင်းကြေး: <b>{money(amount)}</b> တစ်ယောက်စီ\n\n'
+                f'{pvp_dice_matchup(game)}\n\n')
+        if game.get("dice_payout_rule") == PVP_DICE_PAYOUT_RULE:
+            text += "🎲 1/4 → 1.5x · 2/5 → 1.7x · 3/6 → 2x\n\n"
+        text += (f'{pvp_name(target.id,target.full_name)} က Confirm Waiting။ 15sec အတွင်း မနှိပ်ပါက ပွဲပယ်ပါမယ်။ '
+                 '___________________________')
         try:
             posted = await message.reply_text(text, parse_mode="HTML", reply_markup=markup)
             await self.store_call(self.store.set_pvp_message, game["id"], posted.message_id)
@@ -762,19 +785,14 @@ class AuctionBot:
         if remaining:
             raise RuleError(f"တစ်ပွဲပြီးပါပြီ။ {remaining:.1f} sec စောင့်ပြီးမှ ထပ်ကစားပါ။")
         if len(args) != 1:
-            raise RuleError("Solo အတွက် /boom 250၊ 2-player အတွက် ပြိုင်ဘက် message ကို reply လုပ်ပြီး /boom 250 ပုံစံရေးပါ။")
+            raise RuleError("ပြိုင်ဘက် message ကို reply လုပ်ပြီး /boom 250 ပုံစံရေးပါ။")
         reply=message.reply_to_message
         target=reply.from_user if reply and not reply.sender_chat else None
         amount=cents(args[0])
         if not MIN_PVP_WAGER <= amount <= MAX_PVP_WAGER:
             raise RuleError("Boom လောင်းကြေးကို 250 မှ 30000 coin အတွင်းထားပါ။")
         if not target:
-            game_id=secrets.token_hex(8)
-            game=await self.store_call(self.store.create_solo_boom,game_id,message.chat_id,
-                                       user.id,user.full_name,amount)
-            await message.reply_text(boom_text(game),parse_mode="HTML",reply_markup=boom_markup(game))
-            self.arm_game_cooldown(user)
-            return
+            raise RuleError("Boom လုပ်မယ့် user ရဲ့ message ကို reply လုပ်ပါ။")
         if target.is_bot:
             raise RuleError("Bot message ကို reply လုပ်ပြီး Boom မကစားနိုင်ပါ။")
         if target.id == user.id: raise RuleError("ကိုယ့်ကိုယ်ကို Boom request လုပ်လို့မရပါ။")
@@ -1201,11 +1219,8 @@ class AuctionBot:
             try:
                 _, action, game_id = query.data.split(":", 2)
                 if action == "confirm":
-                    percent = secrets.randbelow(98) + 1
-                    if percent >= 50:
-                        percent += 1
                     game = await self.store_call(self.store.accept_pvp, game_id,
-                                                 update.effective_user.id, percent)
+                                                 update.effective_user.id)
                     await query.answer("PvP ပွဲ စတင်ပါပြီ။")
                     await query.edit_message_text(pvp_animation_text(game), parse_mode="HTML")
                 elif action == "cancel":
@@ -1466,6 +1481,9 @@ class AuctionBot:
 
         due_rounds = await self.store_call(self.store.due_pvp)
         for due in due_rounds:
+            if due.get("mode") == "dice":
+                await self.tick_pvp_dice(due, context)
+                continue
             if due["id"] in self.pvp_render_retry or time.monotonic() < self.pvp_edit_after:
                 continue
             game = None
@@ -1487,6 +1505,7 @@ class AuctionBot:
                 log.warning("PvP animation/settlement update failed for round %s", due["id"])
                 if game is not None:
                     self.pvp_render_retry[due["id"]] = {"game": game, "after": time.monotonic() + 10}
+        await self.announce_pvp_dice_results(context)
         now = time.monotonic()
         notifications = await self.store_call(self.store.pending_pvp_slot_notifications)
         for game in notifications:
@@ -1507,6 +1526,42 @@ class AuctionBot:
             else:
                 await self.store_call(self.store.mark_pvp_slot_notified, game["id"])
                 self.pvp_slot_retry_after.pop(game["id"], None)
+
+    async def tick_pvp_dice(self, game, context):
+        try:
+            claimed = await self.store_call(self.store.claim_pvp_dice, game["id"])
+            if claimed:
+                dice = await context.bot.send_dice(
+                    chat_id=claimed["group_id"], emoji="🎲",
+                    reply_parameters=ReplyParameters(claimed["message_id"], allow_sending_without_reply=True) if claimed.get("message_id") else None,
+                    read_timeout=20, write_timeout=20, connect_timeout=10, pool_timeout=5)
+                await self.store_call(self.store.record_pvp_dice, game["id"],
+                                      dice.dice.value, dice.message_id)
+            else:
+                await self.store_call(self.store.advance_pvp, game["id"])
+        except (RuleError, PyMongoError, TelegramError):
+            # The durable claim prevents a retry from rolling a different outcome.
+            # If no result was saved, advance_pvp refunds both stakes after timeout.
+            log.warning("PvP dice processing failed for round %s", game["id"])
+
+    async def announce_pvp_dice_results(self, context):
+        for game in await self.store_call(self.store.pending_pvp_dice_results):
+            if time.monotonic() < self.pvp_dice_retry_after.get(game["id"], 0):
+                continue
+            reply_id = game.get("dice_message_id") or game.get("message_id")
+            try:
+                await context.bot.send_message(
+                    chat_id=game["group_id"], text=pvp_animation_text(game), parse_mode="HTML",
+                    reply_parameters=ReplyParameters(reply_id, allow_sending_without_reply=True) if reply_id else None)
+                await self.store_call(self.store.mark_pvp_dice_result, game["id"])
+            except RetryAfter as exc:
+                delay = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else exc.retry_after
+                self.pvp_dice_retry_after[game["id"]] = time.monotonic() + delay + 1
+            except (TelegramError, PyMongoError):
+                self.pvp_dice_retry_after[game["id"]] = time.monotonic() + 10
+                log.warning("PvP dice result delivery failed for round %s", game["id"])
+            else:
+                self.pvp_dice_retry_after.pop(game["id"], None)
 
     async def error(self, update, context):
         # Avoid logging Telegram URLs/tokens, message bodies, or bidder identities.

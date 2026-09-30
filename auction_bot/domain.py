@@ -12,6 +12,7 @@ MAX_ACTIVE_PVP_GAMES = 3
 PVP_REQUEST_TIMEOUT_SECONDS = 15
 BOOM_TURN_TIMEOUT_SECONDS = 60
 USD_TO_COIN_RATE = 25  # $100 = 2500 coins.
+PVP_DICE_PAYOUT_RULE = "tiered_v1"
 
 
 def cents(value):
@@ -41,3 +42,24 @@ def money(amount):
     whole, fraction = divmod(amount, 100)
     decimals = f".{fraction:02d}".rstrip("0") if fraction else ""
     return f"{whole}{decimals}coin"
+
+
+def pvp_dice_sides(game):
+    """Return the persisted low/high players; older rounds used requester/target."""
+    low = game.get("low_player_id", game["requester_id"])
+    if low not in (game["requester_id"], game["target_id"]):
+        raise RuleError("PvP အံစာဘက် သတ်မှတ်ချက် မမှန်ပါ။")
+    high = game["target_id"] if low == game["requester_id"] else game["requester_id"]
+    return low, high
+
+
+def pvp_dice_outcome(game):
+    value = game.get("dice_value")
+    if type(value) is not int or not 1 <= value <= 6:
+        raise RuleError("PvP အံစာရလဒ် မမှန်ပါ။")
+    low, high = pvp_dice_sides(game)
+    prize = game["amount"] * 2
+    if game.get("dice_payout_rule") == PVP_DICE_PAYOUT_RULE:
+        # Integer subunits: round fractions down to the nearest 0.01 coin.
+        prize = game["amount"] * (15, 17, 20)[(value - 1) % 3] // 10
+    return (low if value <= 3 else high), prize

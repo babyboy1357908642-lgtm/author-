@@ -762,19 +762,14 @@ class AuctionBot:
         if remaining:
             raise RuleError(f"တစ်ပွဲပြီးပါပြီ။ {remaining:.1f} sec စောင့်ပြီးမှ ထပ်ကစားပါ။")
         if len(args) != 1:
-            raise RuleError("Solo အတွက် /boom 250၊ 2-player အတွက် ပြိုင်ဘက် message ကို reply လုပ်ပြီး /boom 250 ပုံစံရေးပါ။")
+            raise RuleError("ပြိုင်ဘက် message ကို reply လုပ်ပြီး /boom 250 ပုံစံရေးပါ။")
         reply=message.reply_to_message
         target=reply.from_user if reply and not reply.sender_chat else None
         amount=cents(args[0])
         if not MIN_PVP_WAGER <= amount <= MAX_PVP_WAGER:
             raise RuleError("Boom လောင်းကြေးကို 250 မှ 30000 coin အတွင်းထားပါ။")
         if not target:
-            game_id=secrets.token_hex(8)
-            game=await self.store_call(self.store.create_solo_boom,game_id,message.chat_id,
-                                       user.id,user.full_name,amount)
-            await message.reply_text(boom_text(game),parse_mode="HTML",reply_markup=boom_markup(game))
-            self.arm_game_cooldown(user)
-            return
+            raise RuleError("Boom လုပ်မယ့် user ရဲ့ message ကို reply လုပ်ပါ။")
         if target.is_bot:
             raise RuleError("Bot message ကို reply လုပ်ပြီး Boom မကစားနိုင်ပါ။")
         if target.id == user.id: raise RuleError("ကိုယ့်ကိုယ်ကို Boom request လုပ်လို့မရပါ။")

@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 import tempfile
 import asyncio
 import threading
@@ -209,6 +209,45 @@ class PvPStoreTests(unittest.TestCase):
         markup = message.reply_text.call_args.kwargs["reply_markup"]
         self.assertEqual(markup.inline_keyboard[0][0].callback_data, f"pvp:confirm:{row['id']}")
         self.assertEqual(markup.inline_keyboard[0][1].callback_data, f"pvp:cancel:{row['id']}")
+
+    def test_boom_command_without_opponent_cannot_start_solo_game(self):
+        bot = object.__new__(AuctionBot)
+        bot.store = Mock()
+        bot.game_cooldown_until = {}
+        user = SimpleNamespace(id=7, is_bot=False, full_name="Player 7")
+        for reply in (None, SimpleNamespace(sender_chat=object(), from_user=None)):
+            with self.subTest(reply=reply):
+                message = SimpleNamespace(chat_id=-100123, reply_to_message=reply,
+                                          reply_text=AsyncMock())
+                with self.assertRaisesRegex(RuleError, "reply"):
+                    asyncio.run(bot.boom_request(["250"], message, user))
+                message.reply_text.assert_not_awaited()
+        self.assertEqual(bot.store.mock_calls, [])
+        self.assertEqual(bot.game_cooldown_until, {})
+
+    def test_boom_command_by_reply_creates_two_player_request(self):
+        bot = object.__new__(AuctionBot)
+        bot.store = Mock()
+        bot.store.create_boom.return_value = {"id": "boom-duel"}
+        bot.game_cooldown_until = {}
+        user = SimpleNamespace(id=7, is_bot=False, full_name="Player 7")
+        target = SimpleNamespace(id=8, is_bot=False, full_name="Player 8")
+        message = SimpleNamespace(
+            chat_id=-100123,
+            reply_to_message=SimpleNamespace(sender_chat=None, from_user=target),
+            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=55)),
+        )
+
+        asyncio.run(bot.boom_request(["250"], message, user))
+
+        bot.store.create_boom.assert_called_once()
+        args = bot.store.create_boom.call_args.args
+        self.assertEqual(args[1:], (-100123, 7, "Player 7", 8, "Player 8", cents("250")))
+        bot.store.create_solo_boom.assert_not_called()
+        bot.store.set_boom_message.assert_called_once_with(args[0], 55)
+        markup = message.reply_text.call_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, f"boom:confirm:{args[0]}")
+        self.assertEqual(markup.inline_keyboard[0][1].callback_data, f"boom:cancel:{args[0]}")
 
     def test_solo_pvp_heads_tails_settles_immediately(self):
         self.credit(7, cents("500"))

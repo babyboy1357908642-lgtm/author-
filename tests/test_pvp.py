@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock
 import tempfile
 import asyncio
 import threading
@@ -162,6 +163,52 @@ class PvPStoreTests(unittest.TestCase):
         self.store.target("group_id", -100123)
         self.assertEqual(self.store.get("group_id"), "-100123")
         self.assertEqual(self.store.get("pvp_group_id"), "-100123")
+
+    def test_pvp_command_without_opponent_rejects_solo_bets(self):
+        self.credit(7, cents("500"))
+        bot = object.__new__(AuctionBot)
+        bot.store = self.store
+        bot.game_cooldown_until = {}
+        user = SimpleNamespace(id=7, is_bot=False, full_name="Player 7")
+        message = SimpleNamespace(chat_id=-100123, reply_to_message=None,
+                                  reply_text=AsyncMock())
+
+        for args in (["250"], ["250", "h"], ["250", "heads"],
+                     ["250", "t"], ["250", "tails"], ["250", "l"]):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(RuleError, "reply"):
+                    asyncio.run(bot.pvp_request(args, message, user))
+
+        self.assertEqual(self.store.wallet_balance(7)["total"], cents("500"))
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM pvp_games").fetchone()[0], 0)
+        self.assertEqual(bot.game_cooldown_until, {})
+        message.reply_text.assert_not_awaited()
+
+    def test_pvp_command_by_reply_still_creates_two_player_request(self):
+        self.credit(7, cents("500"))
+        bot = object.__new__(AuctionBot)
+        bot.store = self.store
+        bot.game_cooldown_until = {}
+        user = SimpleNamespace(id=7, is_bot=False, full_name="Player 7")
+        target = SimpleNamespace(id=8, is_bot=False, full_name="Player 8")
+        message = SimpleNamespace(
+            chat_id=-100123,
+            reply_to_message=SimpleNamespace(sender_chat=None, from_user=target),
+            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=55)),
+        )
+
+        asyncio.run(bot.pvp_request(["250"], message, user))
+
+        row = self.store.db.execute("SELECT * FROM pvp_games").fetchone()
+        self.assertEqual(row["requester_id"], 7)
+        self.assertEqual(row["target_id"], 8)
+        self.assertEqual(row["amount"], cents("250"))
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["message_id"], 55)
+        self.assertEqual(self.store.wallet_balance(7)["total"], cents("500"))
+        markup = message.reply_text.call_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, f"pvp:confirm:{row['id']}")
+        self.assertEqual(markup.inline_keyboard[0][1].callback_data, f"pvp:cancel:{row['id']}")
 
     def test_solo_pvp_heads_tails_settles_immediately(self):
         self.credit(7, cents("500"))

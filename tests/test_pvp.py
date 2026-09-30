@@ -46,18 +46,17 @@ class PvPStoreTests(unittest.TestCase):
         self.assertEqual(accepted["status"], "running")
         self.assertEqual(self.store.wallet_balance(1)["available"], 50000)
         self.assertEqual(self.store.wallet_balance(2)["available"], 50000)
-        with self.assertRaisesRegex(RuleError, "This User Playing"):
-            self.request("busy", 3, 1)
+        self.credit(3)
+        self.assertEqual(self.request("overlap", 3, 1)["status"], "pending")
+        self.assertEqual(self.store.accept_pvp("overlap", 1, 60, now=100)["status"], "running")
 
-    def test_pending_request_locks_requester_and_target(self):
+    def test_pending_requests_allow_shared_requester_and_target(self):
         self.credit(1)
         self.credit(2)
         self.credit(3)
         self.request("pending", 1, 2)
-        with self.assertRaisesRegex(RuleError, "ပွဲပြီး သို့မဟုတ် cancel"):
-            self.request("requester-busy", 1, 3)
-        with self.assertRaisesRegex(RuleError, "ပွဲပြီး သို့မဟုတ် cancel"):
-            self.request("target-busy", 3, 2)
+        self.assertEqual(self.request("shared-requester", 1, 3)["status"], "pending")
+        self.assertEqual(self.request("shared-target", 3, 2)["status"], "pending")
         self.store.cancel_pvp("pending", 1)
         self.request("after-cancel", 1, 3)
 

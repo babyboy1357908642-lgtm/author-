@@ -417,12 +417,6 @@ class Store:
                 raise RuleError("သတ်မှတ်ထားတဲ့ PvP group မှာပဲ ကစားနိုင်ပါတယ်။")
             if self.db.execute("SELECT COUNT(*) FROM pvp_games WHERE group_id=? AND status='running'", (group_id,)).fetchone()[0] >= MAX_ACTIVE_PVP_GAMES:
                 raise RuleError("လက်ရှိ game ၃ ပွဲ ပြည့်နေပါပြီ။ တစ်ပွဲပြီးမှ ပွဲအသစ် စနိုင်ပါမည်။")
-            for user_id in (requester_id, target_id):
-                locked = self.db.execute("SELECT status FROM pvp_games WHERE group_id=? AND status IN ('pending','running') AND (requester_id=? OR target_id=?) LIMIT 1", (group_id,user_id,user_id)).fetchone()
-                if locked:
-                    if locked[0] == "running":
-                        raise RuleError("This User Playing")
-                    raise RuleError("ဒီ user က PvP request သို့ game တစ်ခုမှာ ပါဝင်နေပြီးသားပါ။ ပွဲပြီး သို့မဟုတ် cancel ဖြစ်မှ ထပ်ခေါ်နိုင်ပါတယ်။")
             balance = self.wallet_balance(requester_id)
             if balance["available"] < amount:
                 raise RuleError(f"Coin မလုံလောက်ပါ။ လက်ရှိသုံးနိုင်တာ {money(balance['available'])} ပါ။")
@@ -494,8 +488,6 @@ class Store:
             if active >= MAX_ACTIVE_PVP_GAMES:
                 raise RuleError("လက်ရှိ game ၃ ပွဲ ပြည့်နေပါပြီ။ တစ်ပွဲပြီးမှ ပွဲအသစ် စနိုင်ပါမည်။")
             for user_id in (row["requester_id"],row["target_id"]):
-                if self.db.execute("SELECT 1 FROM pvp_games WHERE group_id=? AND status='running' AND (requester_id=? OR target_id=?) LIMIT 1", (row["group_id"],user_id,user_id)).fetchone():
-                    raise RuleError("This User Playing")
                 balance = self.wallet_balance(user_id)
                 if balance["available"] < row["amount"]:
                     raise RuleError(f"User {user_id} မှာ လိုအပ်တဲ့ coin မလုံလောက်ပါ။")

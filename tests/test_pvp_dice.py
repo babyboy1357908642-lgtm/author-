@@ -300,10 +300,10 @@ class DiceLedgerTests(unittest.TestCase):
                 self.store.claim_pvp_dice(game_id, now=100)
                 self.store.record_pvp_dice(game_id, 5, 777, now=101)
                 create = getattr(self.store, f"create_{kind}")
-                # Both players stay locked while the native dice is still rolling.
-                with self.assertRaises(RuleError):
-                    create(f"early-{kind}", -100123, second, "Second", first,
-                           "First", cents("1000"), now=104)
+                early = create(f"early-{kind}", -100123, second, "Second", first,
+                               "First", cents("1000"), now=104)
+                self.assertEqual(early["status"], "pending")
+                self.assertEqual(self.store._pvp_game(game_id)["status"], "running")
                 game = create(f"next-{kind}", -100123, second, "Second", first,
                               "First", cents("1000"), now=105)
                 self.assertEqual(game["status"], "pending")
@@ -314,10 +314,45 @@ class DiceLedgerTests(unittest.TestCase):
                 self.store.advance_pvp(game_id, now=106)
                 self.assertEqual(self.store.db.wallet_events.count_documents(
                     {"event_key": f"pvp:{game_id}:prize"}), 1)
-                # The new, unanswered challenge must still prevent overlapping play.
-                with self.assertRaises(RuleError):
-                    create(f"overlap-{kind}", -100123, first, "First", second,
-                           "Second", cents("1000"), now=106)
+                overlap = create(f"overlap-{kind}", -100123, first, "First", second,
+                                 "Second", cents("1000"), now=106)
+                self.assertEqual(overlap["status"], "pending")
+
+    def test_shared_players_can_confirm_pvp_and_boom_up_to_group_limit(self):
+        self.request("first")
+        self.store.create_boom("second", -100123, 2, "Second", 1, "First", cents("1000"), now=100)
+        self.store.create_boom("fourth", -100123, 1, "First", 2, "Second", cents("1000"), now=100)
+        self.store.accept_pvp("first", 2, now=100)
+        self.assertEqual(self.store.accept_boom("second", 1, now=100)["status"], "running")
+        self.store.create_pvp("third", -100123, 2, "Second", 1, "First", cents("1000"), now=100)
+        self.assertEqual(self.store.accept_pvp("third", 1, now=100)["status"], "running")
+        with self.assertRaisesRegex(RuleError, "game ၃ ပွဲ"):
+            self.store.accept_boom("fourth", 2, now=100)
+        for uid in (1, 2):
+            self.assertEqual(self.store.wallet_balance(uid)["total"], cents("2000"))
+        self.assertEqual(self.store.db.wallet_events.count_documents(
+            {"kind": {"$in": ["pvp_stake", "boom_stake"]}}), 6)
+        with self.assertRaises(RuleError):
+            self.store.accept_boom("second", 1, now=100)
+        self.assertEqual(self.store.wallet_balance(1)["total"], cents("2000"))
+
+    def test_concurrent_shared_player_confirms_cannot_overspend(self):
+        self.request("pvp", amount="3000")
+        self.store.create_boom("boom", -100123, 1, "First", 2, "Second", cents("3000"), now=100)
+
+        def confirm(kind):
+            try:
+                return getattr(self.store, f"accept_{kind}")(kind, 2, now=100)["status"]
+            except RuleError:
+                return "insufficient"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(confirm, ("pvp", "boom")))
+        self.assertCountEqual(results, ["running", "insufficient"])
+        for uid in (1, 2):
+            self.assertEqual(self.store.wallet_balance(uid)["total"], cents("2000"))
+        self.assertEqual(self.store.db.wallet_events.count_documents(
+            {"kind": {"$in": ["pvp_stake", "boom_stake"]}}), 2)
 
     def test_both_players_can_request_again_as_soon_as_result_is_sent(self):
         self.roll()

@@ -80,14 +80,16 @@ class DicePresentationTests(unittest.TestCase):
         game = dict(dice_game(), status="running", winner_id=None, dice_value=None)
         store.accept_pvp.return_value = game
         bot = bot_for(store)
-        query = SimpleNamespace(data="pvp:confirm:dice", answer=AsyncMock(), edit_message_text=AsyncMock())
+        query = SimpleNamespace(data="pvp:confirm:dice", answer=AsyncMock(),
+                                delete_message=AsyncMock(), edit_message_text=AsyncMock())
         update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=2, is_bot=False),
                                  effective_chat=SimpleNamespace(id=-100123, type="supergroup"))
         context = SimpleNamespace(bot=Mock())
         asyncio.run(bot.callback(update, context))
         store.accept_pvp.assert_called_once_with("dice", 2)
         context.bot.send_dice.assert_not_called()
-        self.assertIn("1 , 2 , 3", query.edit_message_text.call_args.args[0])
+        query.delete_message.assert_awaited_once()
+        query.edit_message_text.assert_not_awaited()
 
 
 @unittest.skipUnless(os.environ.get("TEST_MONGODB_URI"), "TEST_MONGODB_URI requires a disposable replica set")

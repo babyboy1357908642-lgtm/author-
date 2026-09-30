@@ -1222,7 +1222,7 @@ class AuctionBot:
                     game = await self.store_call(self.store.accept_pvp, game_id,
                                                  update.effective_user.id)
                     await query.answer("PvP ပွဲ စတင်ပါပြီ။")
-                    await query.edit_message_text(pvp_animation_text(game), parse_mode="HTML")
+                    await query.delete_message()
                 elif action == "cancel":
                     game = await self.store_call(self.store.cancel_pvp, game_id,
                                                  update.effective_user.id)

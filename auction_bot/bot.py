@@ -78,7 +78,7 @@ AUCTION_GROUP_COMMANDS = [
 ]
 PVP_GROUP_COMMANDS = [
     BotCommand("bid", "Auction ID နဲ့ bid ဆွဲရန်: /bid AUCTION_ID 10.50"),
-    BotCommand("pvp", "Reply duel သို့ coin flip: /pvp 250 h/t"),
+    BotCommand("pvp", "ပြိုင်ဘက် message ကို reply လုပ်ပြီး /pvp 250"),
     BotCommand("boom", "ပြိုင်ဘက်ကို Boom game စိန်ခေါ်ရန်"),
     BotCommand("replay", "Stuck ဖြစ်နေသော ကိုယ့် Solo game ကို refund/ရှင်းရန်"),
     BotCommand("btop", "Coin အများဆုံး Top 10"),
@@ -723,23 +723,8 @@ class AuctionBot:
             raise RuleError(f"တစ်ပွဲပြီးပါပြီ။ {remaining:.1f} sec စောင့်ပြီးမှ ထပ်ကစားပါ။")
         reply = message.reply_to_message
         target = reply.from_user if reply and not reply.sender_chat else None
-        if not target and len(args) == 2:
-            amount = cents(args[0])
-            choice = {"h": "heads", "heads": "heads", "t": "tails", "tails": "tails"}.get(args[1].lower())
-            if not choice:
-                raise RuleError("Solo PvP အတွက် /pvp 250 h သို့ /pvp 250 t ပုံစံရေးပါ။ h=Heads, t=Tails")
-            if not MIN_PVP_WAGER <= amount <= MAX_PVP_WAGER:
-                raise RuleError("PvP လောင်းကြေးကို 250 မှ 30000 coin အတွင်းထားပါ။")
-            result = secrets.choice(("heads", "tails"))
-            game_id = secrets.token_hex(8)
-            game = await self.store_call(self.store.play_solo_pvp, game_id, message.chat_id,
-                                         user.id, user.full_name, amount, choice, result)
-            coin_message = await message.reply_text("🪙")
-            await coin_message.reply_text(pvp_animation_text(game), parse_mode="HTML")
-            self.arm_game_cooldown(user)
-            return
         if len(args) != 1:
-            raise RuleError("ပြိုင်ဘက်ရဲ့ message ကို reply လုပ်ပြီး /pvp 500 သို့မဟုတ် ပိုများသော coin ပမာဏရေးပါ။")
+            raise RuleError("ပြိုင်ဘက်ရဲ့ message ကို reply လုပ်ပြီး /pvp 250 သို့မဟုတ် ပိုများသော coin ပမာဏရေးပါ။")
         if not target or target.is_bot:
             raise RuleError("PvP လုပ်မယ့် user ရဲ့ message ကို reply လုပ်ပါ။")
         if target.id == user.id:

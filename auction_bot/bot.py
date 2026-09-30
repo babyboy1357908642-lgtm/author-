@@ -19,7 +19,7 @@ from telegram.ext import Application, CallbackQueryHandler, InlineQueryHandler, 
 from . import account, welcome
 from .config import Config
 from .source_export import source_zip
-from .domain import MAX_PVP_WAGER, MIN_PVP_WAGER, USD_TO_COIN_RATE, RuleError, cents, money, usd_to_coins
+from .domain import MAX_PVP_WAGER, MIN_PVP_WAGER, USD_TO_COIN_RATE, PVP_DICE_PAYOUT_RULE, RuleError, cents, money, usd_to_coins, pvp_dice_sides, pvp_dice_outcome
 from .mongo_store import MongoStore
 from pymongo.errors import PyMongoError
 
@@ -182,7 +182,7 @@ def usd_equivalent(coin_subunits):
 
 def pvp_payouts(game):
     if game.get("mode") == "dice":
-        return game["amount"] * 2, 0
+        return pvp_dice_outcome(game)[1], 0
     requester_percent = game["final_percent"]
     target_percent = 100 - requester_percent
     winner_id = game["requester_id"] if requester_percent > 50 else game["target_id"]
@@ -192,15 +192,21 @@ def pvp_payouts(game):
     return pot - loser_payout, loser_payout
 
 
+def pvp_dice_matchup(game):
+    low, high = pvp_dice_sides(game)
+    names = {game["requester_id"]: game["requester_name"], game["target_id"]: game["target_name"]}
+    low_color, high_color = ("🟥", "🟩") if game.get("dice_payout_rule") == PVP_DICE_PAYOUT_RULE else ("🟦", "🟥")
+    return (f'{low_color} {pvp_name(low, names[low])} — 1 , 2 , 3\n\n'
+            f'{high_color} {pvp_name(high, names[high])} — 4 , 5 , 6')
+
+
 def pvp_animation_text(game):
     if game.get("mode") == "dice":
-        text = (f'⚔️ <b>PvP · {money(game["amount"])} each</b>\n\n'
-                f'🟦 {pvp_name(game["requester_id"], game["requester_name"])} — 1 , 2 , 3\n\n'
-                f'🟥 {pvp_name(game["target_id"], game["target_name"])} — 4 , 5 , 6')
+        text = f'⚔️ <b>PvP · {money(game["amount"])} each</b>\n\n{pvp_dice_matchup(game)}'
         if game["status"] == "finished":
             winner_name = game["requester_name"] if game["winner_id"] == game["requester_id"] else game["target_name"]
             text += (f'\n\n🏆 Winner: {pvp_name(game["winner_id"], winner_name)}'
-                     f'\n🎲Result : {game["dice_value"]}\n🪙 Prize: {money(game["amount"] * 2)}')
+                     f'\n🎲Result : {game["dice_value"]}\n🪙 Prize: {money(pvp_payouts(game)[0])}')
         elif game["status"] == "cancelled":
             text += f'\n\n❌ အံစာရလဒ် မရသဖြင့် ပွဲပယ်ဖျက်ပြီး တစ်ယောက်စီ {money(game["amount"])} ပြန်အမ်းပြီးပါပြီ။'
         else:
@@ -755,11 +761,12 @@ class AuctionBot:
             button("✅ Confirm", f"pvp:confirm:{game_id}", "success"),
             button("❌ Cancel", f"pvp:cancel:{game_id}", "danger"),
         ]])
-        text = (f'⚔️ PvP စိန်ခေါ်မှု\n\n🟦 {pvp_name(user.id,user.full_name)} — 1 , 2 , 3\n'
-                f'🪙 လောင်းကြေး: <b>{money(amount)}</b> တစ်ယောက်စီ\n'
-                f'🟥 {pvp_name(target.id,target.full_name)} — 4 , 5 , 6\n\n'
-                f'{pvp_name(target.id,target.full_name)} က Confirm Waiting။ 15sec အတွင်း မနှိပ်ပါက ပွဲပယ်ပါမယ်။ '
-                '___________________________')
+        text = (f'⚔️ PvP စိန်ခေါ်မှု\n\n🪙 လောင်းကြေး: <b>{money(amount)}</b> တစ်ယောက်စီ\n\n'
+                f'{pvp_dice_matchup(game)}\n\n')
+        if game.get("dice_payout_rule") == PVP_DICE_PAYOUT_RULE:
+            text += "🎲 1/4 → 1.5x · 2/5 → 1.7x · 3/6 → 2x\n\n"
+        text += (f'{pvp_name(target.id,target.full_name)} က Confirm Waiting။ 15sec အတွင်း မနှိပ်ပါက ပွဲပယ်ပါမယ်။ '
+                 '___________________________')
         try:
             posted = await message.reply_text(text, parse_mode="HTML", reply_markup=markup)
             await self.store_call(self.store.set_pvp_message, game["id"], posted.message_id)

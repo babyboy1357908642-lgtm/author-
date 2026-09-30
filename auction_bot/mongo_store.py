@@ -2,10 +2,11 @@
 import time
 import re
 import random
+import secrets
 from pymongo import MongoClient, ReturnDocument
 from pymongo.read_concern import ReadConcern
 from pymongo.write_concern import WriteConcern
-from .domain import BOOM_TURN_TIMEOUT_SECONDS, MAX_ACTIVE_PVP_GAMES, MAX_PVP_WAGER, MIN_PVP_WAGER, PVP_REQUEST_TIMEOUT_SECONDS, RuleError, money
+from .domain import BOOM_TURN_TIMEOUT_SECONDS, MAX_ACTIVE_PVP_GAMES, MAX_PVP_WAGER, MIN_PVP_WAGER, PVP_REQUEST_TIMEOUT_SECONDS, PVP_DICE_PAYOUT_RULE, RuleError, money, pvp_dice_outcome
 
 PVP_ANIMATION_INTERVAL_SECONDS = 1.2
 PVP_DICE_ANIMATION_SECONDS = 4
@@ -411,6 +412,8 @@ class MongoStore:
     def create_pvp(self,game_id,group_id,requester_id,requester_name,target_id,target_name,amount,now=None):
         if type(amount) is not int or not MIN_PVP_WAGER<=amount<=MAX_PVP_WAGER:raise RuleError("PvP လောင်းကြေးကို 250 မှ 30000 coin အတွင်းထားပါ။")
         if requester_id==target_id:raise RuleError("ကိုယ့်ကိုယ်ကို PvP request လုပ်လို့မရပါ။")
+        # Pick once before transaction retries, and reveal the assignment before Confirm.
+        low_player_id = secrets.choice((requester_id, target_id))
         def create(s):
             at=time.time() if now is None else now
             if str(group_id)!=str(self.get("pvp_group_id",session=s)):
@@ -425,7 +428,8 @@ class MongoStore:
             self.db.pvp_games.insert_one(dict(_id=game_id,id=game_id,group_id=group_id,requester_id=requester_id,
                 requester_name=requester_name[:64],target_id=target_id,target_name=target_name[:64],amount=amount,
                 status="pending",message_id=0,created=at,next_at=None,step=0,final_percent=None,winner_id=None,
-                slot_notified=0),session=s)
+                slot_notified=0, low_player_id=low_player_id,
+                dice_payout_rule=PVP_DICE_PAYOUT_RULE),session=s)
             return self._pvp_game(game_id,s)
         return self._tx(create)
 
@@ -870,8 +874,8 @@ class MongoStore:
             if step<2:
                 self.db.pvp_games.update_one({"_id":game_id,"status":"running"},{"$set":{"step":step,"next_at":at+PVP_ANIMATION_INTERVAL_SECONDS}},session=s)
                 return self._pvp_game(game_id,s)
-            requester_percent = (100 if row["dice_value"] <= 3 else 0) if row.get("mode") == "dice" else row["final_percent"]
-            target_percent = 100 - requester_percent
+            requester_percent = row["final_percent"]
+            target_percent = 100 - requester_percent if requester_percent is not None else None
             if row.get("mode") == "solo":
                 won = row.get("choice") == row.get("result")
                 pot = row["amount"] * 2
@@ -902,12 +906,16 @@ class MongoStore:
                     {"$set":{"status":"finished","winner_id":winner,"step":2,"next_at":None,
                               "prize":prize,"refund":refund,"streak":streak["streak"],"streak_reward":streak["reward"]}},session=s)
                 return self._pvp_game(game_id,s)
-            winner = row["requester_id"] if requester_percent > 50 else row["target_id"]
-            loser = row["target_id"] if winner == row["requester_id"] else row["requester_id"]
-            loser_percent = target_percent if winner == row["requester_id"] else requester_percent
             pot = row["amount"] * 2
-            loser_payout = 0 if loser_percent > 25 else pot * loser_percent // 100
-            winner_payout = pot - loser_payout
+            if row.get("mode") == "dice":
+                winner, winner_payout = pvp_dice_outcome(row)
+                loser_payout = 0
+            else:
+                winner = row["requester_id"] if requester_percent > 50 else row["target_id"]
+                loser_percent = target_percent if winner == row["requester_id"] else requester_percent
+                loser_payout = 0 if loser_percent > 25 else pot * loser_percent // 100
+                winner_payout = pot - loser_payout
+            loser = row["target_id"] if winner == row["requester_id"] else row["requester_id"]
             for uid in (winner, loser):
                 if not self.db.wallets.find_one({"_id":uid},session=s):
                     raise RuleError("Winner/loser wallet မတွေ့ပါ။ Owner က စစ်ဆေးရန်လိုပါတယ်။")
@@ -922,8 +930,11 @@ class MongoStore:
                     note=f"PvP refund · {game_id}",actor_id=None,auction_id=None,event_key=f"pvp:{game_id}:refund",created=at),session=s)
             winner_streak=self._record_streak(s,"pvp",row["group_id"],winner,True,at)
             self._record_streak(s,"pvp",row["group_id"],loser,False,at)
-            self.db.pvp_games.update_one({"_id":game_id,"status":"running"},{"$set":{"status":"finished","winner_id":winner,"step":2,"next_at":None,
-                "streak":winner_streak["streak"],"streak_reward":winner_streak["reward"]}},session=s)
+            settled = {"status": "finished", "winner_id": winner, "step": 2, "next_at": None,
+                       "streak": winner_streak["streak"], "streak_reward": winner_streak["reward"]}
+            if row.get("mode") == "dice":
+                settled.update(prize=winner_payout, refund=0, retained=pot-winner_payout)
+            self.db.pvp_games.update_one({"_id":game_id,"status":"running"}, {"$set":settled}, session=s)
             return self._pvp_game(game_id,s)
         return self._tx(advance)
 

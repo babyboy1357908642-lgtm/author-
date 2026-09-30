@@ -292,6 +292,50 @@ class DiceLedgerTests(unittest.TestCase):
         deadline = self.store._pvp_game("dice")["next_at"]
         self.assertEqual(self.store.advance_pvp("dice", now=deadline)["status"], "cancelled")
 
+    def test_next_request_settles_ready_dice_even_when_worker_is_delayed(self):
+        for kind, first, second in (("pvp", 1, 2), ("boom", 3, 4)):
+            with self.subTest(kind=kind):
+                game_id = f"previous-{kind}"
+                self.accept(game_id, first, second)
+                self.store.claim_pvp_dice(game_id, now=100)
+                self.store.record_pvp_dice(game_id, 5, 777, now=101)
+                create = getattr(self.store, f"create_{kind}")
+                # Both players stay locked while the native dice is still rolling.
+                with self.assertRaises(RuleError):
+                    create(f"early-{kind}", -100123, second, "Second", first,
+                           "First", cents("1000"), now=104)
+                game = create(f"next-{kind}", -100123, second, "Second", first,
+                              "First", cents("1000"), now=105)
+                self.assertEqual(game["status"], "pending")
+                previous = self.store._pvp_game(game_id)
+                self.assertEqual(previous["status"], "finished")
+                self.assertFalse(previous["result_notified"])
+                self.assertEqual(self.store.wallet_balance(second)["total"], cents("5700"))
+                self.store.advance_pvp(game_id, now=106)
+                self.assertEqual(self.store.db.wallet_events.count_documents(
+                    {"event_key": f"pvp:{game_id}:prize"}), 1)
+                # The new, unanswered challenge must still prevent overlapping play.
+                with self.assertRaises(RuleError):
+                    create(f"overlap-{kind}", -100123, first, "First", second,
+                           "Second", cents("1000"), now=106)
+
+    def test_both_players_can_request_again_as_soon_as_result_is_sent(self):
+        self.roll()
+        context = self.context()
+
+        async def result_sent(**kwargs):
+            self.assertIn("🎲Result : 5", kwargs["text"])
+            game = await self.bot.store_call(self.store.create_pvp, "rematch", -100123,
+                2, "Second", 1, "First", cents("1000"), now=106)
+            self.assertEqual(game["status"], "pending")
+
+        context.bot.send_message.side_effect = result_sent
+        asyncio.run(self.bot.announce_pvp_dice_results(context))
+        context.bot.send_message.assert_awaited_once()
+        self.assertEqual(self.store.pending_pvp_dice_results(), [])
+        self.assertEqual(self.store.db.wallet_events.count_documents(
+            {"event_key": "pvp:dice:prize"}), 1)
+
     def test_result_delivery_retries_without_repaying(self):
         self.roll()
         context = self.context()

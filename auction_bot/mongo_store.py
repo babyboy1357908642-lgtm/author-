@@ -409,9 +409,23 @@ class MongoStore:
         return (self.db.pvp_games.count_documents({"group_id":group_id,"status":"running"},session=session)
                 + self.db.boom_games.count_documents({"group_id":group_id,"status":"running"},session=session))
 
+    def _finish_ready_player_dice(self, group_id, player_ids, now=None):
+        """Allow rematches when the animation is over but the worker is delayed."""
+        at = time.time() if now is None else now
+        rows = self.db.pvp_games.find({
+            "group_id": group_id, "status": "running", "mode": "dice",
+            "dice_value": {"$in": list(range(1, 7))}, "next_at": {"$lte": at},
+            "$or": [{"requester_id": {"$in": player_ids}},
+                    {"target_id": {"$in": player_ids}}]}, {"_id": 1})
+        for row in rows:
+            # Use the same atomic, idempotent settlement as the worker. Commit it
+            # separately so a rejected new wager cannot roll back the old prize.
+            self.advance_pvp(row["_id"], now=at)
+
     def create_pvp(self,game_id,group_id,requester_id,requester_name,target_id,target_name,amount,now=None):
         if type(amount) is not int or not MIN_PVP_WAGER<=amount<=MAX_PVP_WAGER:raise RuleError("PvP လောင်းကြေးကို 250 မှ 30000 coin အတွင်းထားပါ။")
         if requester_id==target_id:raise RuleError("ကိုယ့်ကိုယ်ကို PvP request လုပ်လို့မရပါ။")
+        self._finish_ready_player_dice(group_id, [requester_id, target_id], now)
         # Pick once before transaction retries, and reveal the assignment before Confirm.
         low_player_id = secrets.choice((requester_id, target_id))
         def create(s):
@@ -539,6 +553,7 @@ class MongoStore:
             raise RuleError("Boom လောင်းကြေးကို 250 မှ 30000 coin အတွင်းထားပါ။")
         if requester_id == target_id:
             raise RuleError("ကိုယ့်ကိုယ်ကို Boom request လုပ်လို့မရပါ။")
+        self._finish_ready_player_dice(group_id, [requester_id, target_id], now)
         def create(s):
             at = time.time() if now is None else now
             if str(group_id) != str(self.get("pvp_group_id", session=s)):

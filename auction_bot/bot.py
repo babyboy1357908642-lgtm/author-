@@ -362,6 +362,8 @@ class AuctionBot:
         self.channel_id = targets["channel_id"]
         self.group_id = targets["group_id"]
         self.pvp_group_id = self.group_id
+        log.info("Active targets: channel=%s group=%s games=%s", self.channel_id,
+                 self.group_id, self.pvp_group_id)
         self.edit_after = {}
         self.last_bid_at = {}
         self.last_caption_at = {}
@@ -573,9 +575,7 @@ class AuctionBot:
                     await self.auth_command(args, message, update.effective_user.id, context.bot)
                 return
             if (is_owner and not command and message.reply_to_message
-                    and (self.owner(update) or self.group(update) or self.pvp_group(update))
-                    and (not self.owner(update) or not (
-                        context.user_data.get("draft") or context.user_data.get("welcome_edit")))):
+                    and (self.owner(update) or self.group(update) or self.pvp_group(update))):
                 signed_args = signed_owner_message_args(text)
                 if signed_args:
                     await self.auth_command(signed_args, message, update.effective_user.id, context.bot)
@@ -1432,6 +1432,10 @@ class AuctionBot:
             await self.tick_pvp(context)
 
     async def tick_pvp(self, context):
+        await self.tick_pvp_rounds(context)
+        await self.tick_game_expirations(context)
+
+    async def tick_game_expirations(self, context):
         expired = await self.store_call(self.store.expire_pvp)
         for game in expired:
             if not game.get("message_id"):
@@ -1467,6 +1471,8 @@ class AuctionBot:
                     text=boom_text(game), parse_mode="HTML", reply_markup=boom_markup(game))
             except TelegramError:
                 log.warning("Boom turn timeout message update failed for round %s", game["id"])
+
+    async def tick_pvp_rounds(self, context):
         now = time.monotonic()
         for game_id, retry in list(self.pvp_render_retry.items()):
             if now < retry["after"]:
@@ -1607,6 +1613,21 @@ class AuctionBot:
     async def retry_menu(self, context):
         await self.configure_menu(context.application)
 
+    async def run_worker(self, context):
+        kind = context.job.data
+        started = time.monotonic()
+        try:
+            if kind == "games":
+                await self.tick_games(context)
+            else:
+                await self.tick(context)
+        finally:
+            if context.application.running:
+                delay = max(0.05, WORKER_TICK_INTERVAL_SECONDS - (time.monotonic() - started))
+                context.job_queue.run_once(self.run_worker, when=delay, data=kind,
+                                           name=f"worker_{kind}",
+                                           job_kwargs={"misfire_grace_time": None})
+
     async def shutdown(self, application):
         self.store.close()
 
@@ -1618,10 +1639,9 @@ class AuctionBot:
         app.add_handler(CallbackQueryHandler(self.callback))
         app.add_handler(InlineQueryHandler(self.inline_search))
         app.add_error_handler(self.error)
-        app.job_queue.run_repeating(self.tick, interval=WORKER_TICK_INTERVAL_SECONDS,
-                                    first=1, job_kwargs={"max_instances": 1, "coalesce": True})
-        app.job_queue.run_repeating(self.tick_games, interval=WORKER_TICK_INTERVAL_SECONDS,
-                                    first=1, job_kwargs={"max_instances": 1, "coalesce": True})
+        for kind in ("auctions", "games"):
+            app.job_queue.run_once(self.run_worker, when=1, data=kind, name=f"worker_{kind}",
+                                   job_kwargs={"misfire_grace_time": None})
         return app
 
 
@@ -1629,6 +1649,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+    # Completion-driven jobs are re-added every pass; retain warnings/errors only.
+    logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
     try:
         config = Config.from_env()
     except ValueError as exc:

@@ -1,8 +1,12 @@
 """Routing and scheduling regressions with synthetic Telegram messages."""
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
+
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from auction_bot.bot import AuctionBot, signed_owner_message_args
 
@@ -94,9 +98,95 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_application_schedules_auction_and_game_workers_separately(self):
         bot = runtime_bot()
         app = bot.application()
-        callbacks = [job.callback for job in app.job_queue.jobs()]
-        self.assertIn(bot.tick, callbacks)
-        self.assertIn(bot.tick_games, callbacks)
+        jobs = app.job_queue.jobs()
+        self.assertCountEqual([job.data for job in jobs], ["auctions", "games"])
+        self.assertTrue(all(job.callback == bot.run_worker for job in jobs))
+        self.assertTrue(all(type(job.job.trigger).__name__ == "DateTrigger" for job in jobs))
+        self.assertTrue(all(job.job.misfire_grace_time is None for job in jobs))
+
+    async def test_slow_worker_only_schedules_next_pass_after_completion(self):
+        bot = runtime_bot()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow_tick(context):
+            entered.set()
+            await release.wait()
+        bot.tick_games = AsyncMock(side_effect=slow_tick)
+        context = SimpleNamespace(job=SimpleNamespace(data="games"), job_queue=Mock(),
+                                  application=SimpleNamespace(running=True))
+        task = asyncio.create_task(bot.run_worker(context))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            context.job_queue.run_once.assert_not_called()
+            bot.tick_games.assert_awaited_once()
+        finally:
+            release.set()
+            await task
+        context.job_queue.run_once.assert_called_once()
+        args = context.job_queue.run_once.call_args
+        self.assertEqual(args.args[0], bot.run_worker)
+        self.assertEqual(args.kwargs["data"], "games")
+        self.assertGreaterEqual(args.kwargs["when"], 0.05)
+
+    async def test_actual_scheduler_handles_late_start_and_slow_passes_without_skips(self):
+        bot = runtime_bot()
+        scheduler = AsyncIOScheduler()
+        warnings, active, maximum, passes = [], 0, 0, 0
+        finished = asyncio.Event()
+        context = SimpleNamespace(job=SimpleNamespace(data="games"),
+                                  application=SimpleNamespace(running=True))
+        def run_once(callback, when, **options):
+            scheduler.add_job(callback, "date",
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=when),
+                args=[context], name=options["name"], **options["job_kwargs"])
+        context.job_queue = SimpleNamespace(run_once=run_once)
+        async def slow_tick(context):
+            nonlocal active, maximum, passes
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.03)
+            active -= 1
+            passes += 1
+            if passes == 3:
+                context.application.running = False
+                finished.set()
+        bot.tick_games = AsyncMock(side_effect=slow_tick)
+        scheduler.add_listener(warnings.append, EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED)
+        run_once(bot.run_worker, -20, name="worker_games", job_kwargs={"misfire_grace_time": None})
+        with patch("auction_bot.bot.WORKER_TICK_INTERVAL_SECONDS", 0.01):
+            scheduler.start()
+            try:
+                await asyncio.wait_for(finished.wait(), 3)
+                self.assertEqual((passes, maximum), (3, 1))
+                self.assertEqual(warnings, [])
+            finally:
+                context.application.running = False
+                scheduler.shutdown(wait=False)
+
+    async def test_failed_worker_retries_but_shutdown_does_not_reschedule(self):
+        bot = runtime_bot()
+        bot.tick = AsyncMock(side_effect=RuntimeError("synthetic failure"))
+        context = SimpleNamespace(job=SimpleNamespace(data="auctions"), job_queue=Mock(),
+                                  application=SimpleNamespace(running=True))
+        with self.assertRaises(RuntimeError):
+            await bot.run_worker(context)
+        context.job_queue.run_once.assert_called_once()
+        context.job_queue.reset_mock()
+        context.application.running = False
+        with self.assertRaises(RuntimeError):
+            await bot.run_worker(context)
+        context.job_queue.run_once.assert_not_called()
+
+    async def test_due_rounds_are_processed_before_expired_message_edits(self):
+        bot = runtime_bot()
+        seen = []
+        async def rounds(context):
+            seen.append("rounds")
+        async def expire(context):
+            self.assertEqual(seen, ["rounds"])
+        bot.tick_pvp_rounds = AsyncMock(side_effect=rounds)
+        bot.tick_game_expirations = AsyncMock(side_effect=expire)
+        await bot.tick_pvp(SimpleNamespace())
+        bot.tick_game_expirations.assert_awaited_once()
 
     def test_mobile_signed_amounts_preserve_usd_syntax(self):
         for text, expected in (("+ ၁၀၀", ["+100"]), ("−$5", ["-$5"]),

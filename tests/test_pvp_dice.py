@@ -440,7 +440,7 @@ class DiceLedgerTests(unittest.TestCase):
                          {"total": cents("1000"), "held": cents("250"), "available": cents("750")})
         self.assertEqual(self.store.db.coord.find_one({"_id": "ledger"})["version"], before)
 
-    def test_target_changes_survive_restart_and_sync_game_settings(self):
+    def test_environment_targets_override_saved_settings_on_every_restart(self):
         self.store.set("channel_id", "-100111")
         self.store.set("group_id", "-100222")
         self.store.configure_targets("-100333", "-100444")
@@ -456,12 +456,48 @@ class DiceLedgerTests(unittest.TestCase):
         with patch("auction_bot.bot.MongoStore", return_value=self.store):
             bot = AuctionBot(config)
         self.assertEqual((bot.channel_id, bot.group_id, bot.pvp_group_id),
-                         ("-100555", "-100666", "-100666"))
+                         ("-100333", "-100444", "-100444"))
+        # Even legacy last-environment markers cannot override deployment IDs.
+        self.store.set("channel_id_env", "-100777")
+        self.store.set("group_id_env", "-100888")
         # A later deployment with different IDs takes effect as well.
         changed = self.store.configure_targets("-100777", "-100888")
         self.assertEqual(changed, {"channel_id": "-100777", "group_id": "-100888"})
         self.assertEqual(self.store.get("pvp_group_id"), "-100888")
         self.assertEqual(self.store.configure_targets("", ""), changed)
+
+    def test_owner_signed_replies_change_wallet_in_env_group_and_private_with_drafts(self):
+        self.store.set("group_id", "-100999")
+        config = SimpleNamespace(mongodb_uri=os.environ["TEST_MONGODB_URI"],
+            mongodb_database=self.database, channel_id="-100456", group_id="-100123", owners={99})
+        with patch("auction_bot.bot.MongoStore", return_value=self.store):
+            bot = AuctionBot(config)
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()),
+                                  user_data={"draft": {"step": "photo"}, "welcome_edit": "text"})
+        owner = SimpleNamespace(id=99, is_bot=False)
+        for chat_id, chat_type in ((-100123, "supergroup"), (99, "private")):
+            chat = SimpleNamespace(id=chat_id, type=chat_type)
+            for mid, text in enumerate(("+ 100", "- 20"), 1):
+                message = SimpleNamespace(sender_chat=None, text=text, chat=chat, chat_id=chat_id,
+                    message_id=mid, reply_text=AsyncMock(), reply_to_message=SimpleNamespace(
+                        sender_chat=None, from_user=SimpleNamespace(id=77, is_bot=False)))
+                update = SimpleNamespace(message=message, effective_chat=chat, effective_user=owner)
+                asyncio.run(bot.message(update, context))
+                self.assertIn("✅", message.reply_text.call_args.args[0])
+                # Redelivery of the same owner update cannot apply the delta twice.
+                asyncio.run(bot.message(update, context))
+        self.assertEqual(self.store.wallet_balance(77)["total"], cents("4000"))
+        self.assertEqual(self.store.db.wallet_events.count_documents({"user_id": 77}), 4)
+        # Old group messages and other users cannot adjust wallets.
+        for chat_id, uid in ((-100999, 99), (-100123, 88)):
+            chat = SimpleNamespace(id=chat_id, type="supergroup")
+            message = SimpleNamespace(sender_chat=None, text="+100", chat=chat, chat_id=chat_id,
+                message_id=50, reply_text=AsyncMock(), reply_to_message=SimpleNamespace(
+                    sender_chat=None, from_user=SimpleNamespace(id=77, is_bot=False)))
+            asyncio.run(bot.message(SimpleNamespace(message=message, effective_chat=chat,
+                effective_user=SimpleNamespace(id=uid, is_bot=False)), context))
+            message.reply_text.assert_not_awaited()
+        self.assertEqual(self.store.wallet_balance(77)["total"], cents("4000"))
 
     def test_idle_game_checks_skip_writes_but_expire_and_timeout_due_games(self):
         before = self.store.db.coord.find_one({"_id": "ledger"})["version"]

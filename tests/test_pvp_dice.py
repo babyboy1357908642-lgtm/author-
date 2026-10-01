@@ -440,6 +440,50 @@ class DiceLedgerTests(unittest.TestCase):
                          {"total": cents("1000"), "held": cents("250"), "available": cents("750")})
         self.assertEqual(self.store.db.coord.find_one({"_id": "ledger"})["version"], before)
 
+    def test_target_changes_survive_restart_and_sync_game_settings(self):
+        self.store.set("channel_id", "-100111")
+        self.store.set("group_id", "-100222")
+        self.store.configure_targets("-100333", "-100444")
+        self.assertEqual(self.store.get("channel_id"), "-100333")
+        self.assertEqual(self.store.get("pvp_group_id"), "-100444")
+        self.store.target("channel_id", "-100555")
+        self.store.target("group_id", "-100666")
+        self.assertEqual(self.store.get("pvp_group_id"), "-100666")
+        self.store.close()
+        self.store = MongoStore(os.environ["TEST_MONGODB_URI"], self.database)
+        config = SimpleNamespace(mongodb_uri=os.environ["TEST_MONGODB_URI"],
+            mongodb_database=self.database, channel_id="-100333", group_id="-100444")
+        with patch("auction_bot.bot.MongoStore", return_value=self.store):
+            bot = AuctionBot(config)
+        self.assertEqual((bot.channel_id, bot.group_id, bot.pvp_group_id),
+                         ("-100555", "-100666", "-100666"))
+        # A later deployment with different IDs takes effect as well.
+        changed = self.store.configure_targets("-100777", "-100888")
+        self.assertEqual(changed, {"channel_id": "-100777", "group_id": "-100888"})
+        self.assertEqual(self.store.get("pvp_group_id"), "-100888")
+        self.assertEqual(self.store.configure_targets("", ""), changed)
+
+    def test_idle_game_checks_skip_writes_but_expire_and_timeout_due_games(self):
+        before = self.store.db.coord.find_one({"_id": "ledger"})["version"]
+        self.assertEqual(self.store.expire_pvp(now=100), [])
+        self.assertEqual(self.store.expire_boom(now=100), [])
+        self.assertEqual(self.store.timeout_boom(now=100), [])
+        self.assertEqual(self.store.db.coord.find_one({"_id": "ledger"})["version"], before)
+        self.request("expires", now=100)
+        self.store.create_boom("boom-expires", -100123, 1, "First", 2, "Second", cents("250"), now=100)
+        self.assertEqual(self.store.expire_pvp(now=114), [])
+        self.assertEqual(self.store.expire_boom(now=114), [])
+        self.assertEqual(self.store.expire_pvp(now=115)[0]["status"], "cancelled")
+        self.assertEqual(self.store.expire_boom(now=115)[0]["status"], "cancelled")
+        self.store.create_boom("timeout", -100123, 1, "First", 2, "Second", cents("250"), now=120)
+        self.store.accept_boom("timeout", 2, now=120)
+        self.assertEqual(self.store.timeout_boom(now=120), [])
+        games = self.store.timeout_boom(now=1000)
+        self.assertEqual(games[0]["status"], "finished")
+        self.assertEqual(self.store.timeout_boom(now=1001), [])
+        self.assertEqual(self.store.db.wallet_events.count_documents(
+            {"event_key": "boom:timeout:prize"}), 1)
+
     def test_existing_percentage_rounds_keep_their_original_payout(self):
         self.request()
         self.store.accept_pvp("dice", 2, 80, now=100)

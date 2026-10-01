@@ -107,19 +107,16 @@ class MongoStore:
         return result.upserted_id is not None
 
     def configure_targets(self, channel_id, group_id):
-        """Apply changed deployment IDs; retain later owner changes on restart."""
+        """Railway/environment IDs override saved targets on every startup."""
         def configure(session):
             targets = {}
             for key, supplied in (("channel_id", channel_id), ("group_id", group_id)):
                 supplied = str(supplied or "")
                 current = self.get(key, session=session)
-                previous_env = self.get(f"{key}_env", None, session=session)
-                if supplied and (supplied != previous_env or not current):
+                if supplied:
                     current = supplied
                     self.db.settings.update_one({"_id": key}, {"$set": {"value": current}},
                                                 upsert=True, session=session)
-                self.db.settings.update_one({"_id": f"{key}_env"},
-                    {"$set": {"value": supplied}}, upsert=True, session=session)
                 targets[key] = str(current or "")
             self.db.settings.update_one({"_id": "pvp_group_id"},
                 {"$set": {"value": targets["group_id"]}}, upsert=True, session=session)

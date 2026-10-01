@@ -383,9 +383,16 @@ class AuctionBot:
 
     async def store_call(self, operation, *args, **kwargs):
         """Keep synchronous MongoDB I/O off the asyncio event loop; SQLite stays local."""
-        if isinstance(self.store, MongoStore):
-            return await asyncio.to_thread(operation, *args, **kwargs)
-        return operation(*args, **kwargs)
+        try:
+            if isinstance(self.store, MongoStore):
+                return await asyncio.to_thread(operation, *args, **kwargs)
+            return operation(*args, **kwargs)
+        except PyMongoError as exc:
+            # Report the operation and error type, never database URIs or payloads.
+            log.warning("Database operation %s failed (%s, code=%s)",
+                        getattr(operation, "__name__", "unknown"), type(exc).__name__,
+                        getattr(exc, "code", None))
+            raise
 
     def button_cooldown(self, user):
         """Return remaining seconds for callback clicks, then arm a six-second cooldown."""

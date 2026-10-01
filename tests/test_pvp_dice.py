@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
-from pymongo.errors import PyMongoError
+from pymongo.errors import OperationFailure, PyMongoError
 from telegram.error import TimedOut
 
 from auction_bot.bot import AuctionBot, pvp_animation_text, pvp_payouts
@@ -74,6 +74,18 @@ class DicePresentationTests(unittest.TestCase):
             game = dict(dice_game(value), amount=cents("250.01"),
                         dice_payout_rule=PVP_DICE_PAYOUT_RULE)
             self.assertEqual(pvp_dice_outcome(game)[1], expected)
+
+    def test_database_error_logs_safe_diagnostics_without_repeating_a_write(self):
+        bot = bot_for(Mock(spec=MongoStore))
+        error = OperationFailure("synthetic-private-payload", code=11000)
+        operation = Mock(__name__="adjust_wallet", side_effect=error)
+        with self.assertLogs("auction_bot.bot", level="WARNING") as logs:
+            with self.assertRaises(OperationFailure) as raised:
+                asyncio.run(bot.store_call(operation, 1, 100))
+        self.assertIs(raised.exception, error)
+        operation.assert_called_once_with(1, 100)
+        self.assertIn("adjust_wallet failed (OperationFailure, code=11000)", logs.output[0])
+        self.assertNotIn("synthetic-private-payload", logs.output[0])
 
     def test_confirm_reserves_stakes_without_picking_a_local_result(self):
         store = Mock()
@@ -382,6 +394,51 @@ class DiceLedgerTests(unittest.TestCase):
         self.assertEqual(self.store.pending_pvp_dice_results(), [])
         self.assertEqual(self.store.db.wallet_events.count_documents({"event_key": "pvp:dice:prize"}), 1)
         self.assertEqual(self.store.wallet_balance(2)["total"], cents("5700"))
+
+    def test_repeated_streak_rewards_settle_with_legacy_reward_history(self):
+        for category in ("pvp", "boom"):
+            with self.subTest(category=category):
+                for uid in (1, 2):
+                    self.store.adjust_wallet(uid, cents("10000"), 99, f"fund:{category}:{uid}")
+                for index in range(13):
+                    game_id = f"streak-{category}-{index}"
+                    at = 100 + index * 10
+                    won = index != 6  # Six wins, one loss, another six wins.
+                    create = getattr(self.store, f"create_{category}")
+                    with patch("auction_bot.mongo_store.secrets.choice", return_value=1):
+                        create(game_id, -100123, 1, "First", 2, "Second", cents("250"), now=at)
+                    game = getattr(self.store, f"accept_{category}")(game_id, 2, now=at)
+                    if category == "pvp":
+                        self.store.claim_pvp_dice(game_id, now=at)
+                        self.store.record_pvp_dice(game_id, 3 if won else 6, 777 + index, now=at)
+                        game = self.store.advance_pvp(game_id, now=at + 4)
+                        self.assertEqual(self.store.advance_pvp(game_id, now=at + 5), game)
+                    else:
+                        number = next(int(n) for n, uid in game["boom_owners"].items()
+                                      if uid == (1 if won else 2))
+                        game = self.store.pick_boom(game_id, 1, number, now=at)
+                        with self.assertRaises(RuleError):
+                            self.store.pick_boom(game_id, 1, number, now=at + 1)
+                    self.assertEqual(game["status"], "finished")
+                    self.assertEqual(game["winner_id"], 1 if won else 2)
+                    if index in (2, 5):
+                        # Existing deployments already contain these old unique keys.
+                        event = self.store.db.wallet_events.find_one({
+                            "kind": "streak_reward", "note": f"{category} {index + 1}-win streak reward"})
+                        self.store.db.wallet_events.update_one({"_id": event["_id"]},
+                            {"$set": {"event_key": f"streak:{category}:-100123:1:{index + 1}"}})
+                rewards = list(self.store.db.wallet_events.find({
+                    "kind": "streak_reward", "note": {"$regex": f"^{category} "}}))
+                self.assertEqual(len(rewards), 4)
+                self.assertEqual(sum(r["delta"] for r in rewards), cents("4000"))
+
+    def test_balance_read_does_not_write_to_shared_ledger(self):
+        self.store.adjust_wallet(1, cents("1000"), 99, "balance-fund")
+        self.store.db.holds.insert_one({"_id": 123, "user_id": 1, "amount": cents("250")})
+        before = self.store.db.coord.find_one({"_id": "ledger"})["version"]
+        self.assertEqual(self.store.wallet_balance(1),
+                         {"total": cents("1000"), "held": cents("250"), "available": cents("750")})
+        self.assertEqual(self.store.db.coord.find_one({"_id": "ledger"})["version"], before)
 
     def test_existing_percentage_rounds_keep_their_original_payout(self):
         self.request()

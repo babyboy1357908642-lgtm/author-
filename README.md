@@ -40,7 +40,7 @@ MONGODB_DATABASE=authbid_bot
 - `BOT_TOKEN`: @BotFather ကပေးသော token။ Git ထဲမတင်ပါနှင့်။
 - `OWNER_IDS`: Owner Telegram **numeric user ID**။ Owner အများကြီးဆို comma ခြားရေးပါ။ Username မသုံးပါနှင့်။ Owner IDs ကို environment မှသာ သတ်မှတ်နိုင်သည်။
 - `CHANNEL_ID`, `GROUP_ID`: Numeric chat IDs။ အစမှာ ချန်ထားပြီး owner private chat ရဲ့ `/setchannel` နှင့် `/setgroup` နဲ့ သတ်မှတ်လည်းရသည်။
-- Environment chat IDs သည် empty database အတွက် bootstrap ဖြစ်သည်။ Bot commands နှင့်သိမ်းထားသော settings က restart ပြီးလည်း အကျုံးဝင်သည်။
+- Environment chat IDs ကို ပထမ startup နှင့် value ပြောင်းထားသော restart မှာ သုံးသည်။ `/setchannel`၊ `/setgroup` ဖြင့် နောက်မှပြောင်းထားသော settings ကို environment value အတူတူဖြင့် restart လုပ်လျှင် ဆက်သုံးသည်။ `GROUP_ID` နှင့် `/setgroup` က auction နှင့် PvP/Boom group နှစ်ခုလုံးကို ပြောင်းပေးသည်။
 - `MONGODB_URI`: မဖြစ်မနေလိုအပ်သော MongoDB Atlas သို့ replica set connection string။ Standalone MongoDB သည် multi-document transactions မရသဖြင့် မသုံးနိုင်ပါ။ `MONGODB_DATABASE`: database name (default `authbid_bot`)။
 - URI မရှိလျှင် startup ရပ်သည်။ Bot runtime သည် MongoDB တစ်ခုတည်းသုံးပြီး SQLite fallback/backend မပါပါ။ SQLite ကို legacy data migration နှင့် test utility အတွက်သာ ထားသည်။ `.env` နှင့် backups ကို private ထားပါ။
 

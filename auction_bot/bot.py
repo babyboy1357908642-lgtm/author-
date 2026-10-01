@@ -133,6 +133,7 @@ def auth_adjustment(args, message):
 
 
 def signed_owner_message_args(text):
+    text = text.translate(str.maketrans("၀၁၂၃၄၅၆၇၈၉−–－＋", "0123456789---+"))
     match = re.fullmatch(r"([+-])\s*(\$?[0-9]{1,9}(?:\.[0-9]{1,2})?)(?:\s+(.+))?", text.strip())
     if not match:
         return None
@@ -357,15 +358,9 @@ class AuctionBot:
         if not config.mongodb_uri:
             raise ValueError("MONGODB_URI is required; SQLite is not supported by the bot runtime.")
         self.store = MongoStore(config.mongodb_uri, config.mongodb_database)
-        # Environment IDs are authoritative.  This lets a deployment move to a
-        # new group/channel instead of silently reusing stale MongoDB settings.
-        for key, value in [("channel_id", config.channel_id), ("group_id", config.group_id)]:
-            if value and self.store.get(key) != value:
-                self.store.set(key, value)
-        self.channel_id = str(self.store.get("channel_id") or "")
-        self.group_id = str(self.store.get("group_id") or "")
-        # GROUP_ID is the single discussion/game group.  Ignore any legacy
-        # pvp_group_id setting so old deployments cannot split the commands.
+        targets = self.store.configure_targets(config.channel_id, config.group_id)
+        self.channel_id = targets["channel_id"]
+        self.group_id = targets["group_id"]
         self.pvp_group_id = self.group_id
         self.edit_after = {}
         self.last_bid_at = {}
@@ -380,6 +375,7 @@ class AuctionBot:
         self.pvp_render_retry = {}
         self.pvp_dice_retry_after = {}
         self.tick_lock = asyncio.Lock()
+        self.game_tick_lock = asyncio.Lock()
 
     async def store_call(self, operation, *args, **kwargs):
         """Keep synchronous MongoDB I/O off the asyncio event loop; SQLite stays local."""
@@ -578,8 +574,8 @@ class AuctionBot:
                 return
             if (is_owner and not command and message.reply_to_message
                     and (self.owner(update) or self.group(update) or self.pvp_group(update))
-                    and not context.user_data.get("draft")
-                    and not context.user_data.get("welcome_edit")):
+                    and (not self.owner(update) or not (
+                        context.user_data.get("draft") or context.user_data.get("welcome_edit")))):
                 signed_args = signed_owner_message_args(text)
                 if signed_args:
                     await self.auth_command(signed_args, message, update.effective_user.id, context.bot)
@@ -701,18 +697,17 @@ class AuctionBot:
         changed = await self.store_call(self.store.adjust_wallet, user_id, delta, actor_id,
             f"owner:{message.chat_id}:{message.message_id}", note)
         available = (await self.store_call(self.store.wallet_balance, user_id))["available"]
-        notified = await self.wallet_credit_notification(bot, user_id, delta, available) if changed else True
         if changed:
             operation = "ထည့်" if delta>0 else "နုတ်"
             text = f"✅ User {user_id} အတွက် USD {usd_equivalent(abs(delta))} ({money(abs(delta))}) {operation}ပြီးပါပြီ။"
-            if not notified:
-                text += "\n⚠️ User ကို DM မပို့နိုင်ပါ။ သူ့ bot DM မှာ /start လုပ်ထားကြောင်းစစ်ပါ။"
         else:
             text = "ဒီ request ကို အရင်က လုပ်ပြီးပါပြီ။ ထပ်မံငွေမပြောင်းပါ။"
         # Group confirmations don't publish a user's full wallet balance.
         if message.chat.type == "private":
             text += f'\nAvailable: {money(available)}'
         await message.reply_text(text)
+        if changed and not await self.wallet_credit_notification(bot, user_id, delta, available):
+            await message.reply_text("⚠️ User ကို DM မပို့နိုင်ပါ။ သူ့ bot DM မှာ /start လုပ်ထားကြောင်းစစ်ပါ။")
 
     def owner_wallet_adjustment(self, command, args, message):
         if not args:
@@ -990,6 +985,7 @@ class AuctionBot:
                 self.channel_id = str(chat_id)
             else:
                 self.group_id = str(chat_id)
+                self.pvp_group_id = self.group_id
             result = "✅ သိမ်းပြီးပါပြီ။ /check နဲ့ ချိတ်ဆက်မှု စစ်ပါ။"
         elif command == "increment":
             await self.store_call(self.store.set, "increment", cents(args[0]))
@@ -1429,6 +1425,10 @@ class AuctionBot:
                 self.last_caption_at[row["id"]] = time.monotonic()
 
             await self.announce_winners(context)
+
+    async def tick_games(self, context):
+        # Channel edits and flood waits must not delay game settlement.
+        async with self.game_tick_lock:
             await self.tick_pvp(context)
 
     async def tick_pvp(self, context):
@@ -1619,6 +1619,8 @@ class AuctionBot:
         app.add_handler(InlineQueryHandler(self.inline_search))
         app.add_error_handler(self.error)
         app.job_queue.run_repeating(self.tick, interval=WORKER_TICK_INTERVAL_SECONDS,
+                                    first=1, job_kwargs={"max_instances": 1, "coalesce": True})
+        app.job_queue.run_repeating(self.tick_games, interval=WORKER_TICK_INTERVAL_SECONDS,
                                     first=1, job_kwargs={"max_instances": 1, "coalesce": True})
         return app
 

@@ -36,6 +36,12 @@ class MongoStore:
         self.db.messages.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
         self.db.pvp_games.create_index([("group_id", 1), ("status", 1), ("next_at", 1)])
         self.db.pvp_games.create_index([("status", 1), ("requester_id", 1), ("target_id", 1)])
+        # Worker scans use status/deadline without a group filter.
+        self.db.pvp_games.create_index([("status", 1), ("next_at", 1)])
+        self.db.pvp_games.create_index([("status", 1), ("created", 1)])
+        self.db.boom_games.create_index([("group_id", 1), ("status", 1)])
+        self.db.boom_games.create_index([("status", 1), ("created", 1)])
+        self.db.boom_games.create_index([("status", 1), ("turn_at", 1)])
         self.db.coord.update_one({"_id":"ledger"}, {"$setOnInsert":{"version":0}}, upsert=True)
         # Upgrade only the untouched legacy default; preserve an owner's custom setting.
         self.db.settings.update_one({"_id":"increment","value":"5000"}, {"$set":{"value":"25000"}})
@@ -100,12 +106,35 @@ class MongoStore:
             {"_id": user_id}, {"$setOnInsert": {"created": int(time.time())}}, upsert=True)
         return result.upserted_id is not None
 
+    def configure_targets(self, channel_id, group_id):
+        """Apply changed deployment IDs; retain later owner changes on restart."""
+        def configure(session):
+            targets = {}
+            for key, supplied in (("channel_id", channel_id), ("group_id", group_id)):
+                supplied = str(supplied or "")
+                current = self.get(key, session=session)
+                previous_env = self.get(f"{key}_env", None, session=session)
+                if supplied and (supplied != previous_env or not current):
+                    current = supplied
+                    self.db.settings.update_one({"_id": key}, {"$set": {"value": current}},
+                                                upsert=True, session=session)
+                self.db.settings.update_one({"_id": f"{key}_env"},
+                    {"$set": {"value": supplied}}, upsert=True, session=session)
+                targets[key] = str(current or "")
+            self.db.settings.update_one({"_id": "pvp_group_id"},
+                {"$set": {"value": targets["group_id"]}}, upsert=True, session=session)
+            return targets
+        return self._tx(configure)
+
     def target(self, key, value):
         def change(s):
-            if self.get(key,session=s)==str(value): return
-            if self.db.auctions.find_one({"status":{"$in":["active","publishing"]}},session=s):
-                raise RuleError("Channel/group ပြောင်းမယ်ဆို active/publishing လေလံတွေကို အရင်ပိတ်ပါ။")
-            self.db.settings.update_one({"_id":key},{"$set":{"value":str(value)}},upsert=True,session=s)
+            if self.get(key,session=s)!=str(value):
+                if self.db.auctions.find_one({"status":{"$in":["active","publishing"]}},session=s):
+                    raise RuleError("Channel/group ပြောင်းမယ်ဆို active/publishing လေလံတွေကို အရင်ပိတ်ပါ။")
+                self.db.settings.update_one({"_id":key},{"$set":{"value":str(value)}},upsert=True,session=s)
+            if key == "group_id":
+                self.db.settings.update_one({"_id":"pvp_group_id"},
+                    {"$set":{"value":str(value)}},upsert=True,session=s)
         self._tx(change)
 
     def set_pvp_group(self, group_id):
@@ -589,6 +618,8 @@ class MongoStore:
     def expire_boom(self, now=None):
         at = time.time() if now is None else now
         cutoff = at - PVP_REQUEST_TIMEOUT_SECONDS
+        if not self.db.boom_games.find_one({"status":"pending","created":{"$lte":cutoff}}, {"_id":1}):
+            return []
         def expire(s):
             rows = list(self.db.boom_games.find({"status":"pending","created":{"$lte":cutoff}},session=s))
             expired=[]
@@ -720,6 +751,9 @@ class MongoStore:
 
     def timeout_boom(self, now=None):
         at=time.time() if now is None else now
+        if not self.db.boom_games.find_one(
+                {"status":"running","turn_at":{"$lte":at-BOOM_TURN_TIMEOUT_SECONDS}}, {"_id":1}):
+            return []
         def settle(s):
             rows=list(self.db.boom_games.find({"status":"running","turn_at":{"$lte":at-BOOM_TURN_TIMEOUT_SECONDS}},session=s))
             finished=[]
@@ -767,6 +801,8 @@ class MongoStore:
     def expire_pvp(self, now=None):
         at = time.time() if now is None else now
         cutoff = at - PVP_REQUEST_TIMEOUT_SECONDS
+        if not self.db.pvp_games.find_one({"status":"pending","created":{"$lte":cutoff}}, {"_id":1}):
+            return []
         def expire(s):
             rows = list(self.db.pvp_games.find(
                 {"status": "pending", "created": {"$lte": cutoff}}, session=s))

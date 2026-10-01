@@ -46,11 +46,13 @@ class MongoStore:
     def close(self):
         self.client.close()
 
-    def _tx(self, operation):
+    def _tx(self, operation, *, read_only=False):
         def execute(session):
-            # A shared write serializes ledger decisions, including cross-auction holds.
+            # Serialize mutations, including cross-auction holds. Read-only
+            # snapshots need no shared write and do not contend with game stakes.
             # Driver retries write conflicts by rerunning the entire callback.
-            self.db.coord.update_one({"_id":"ledger"},{"$inc":{"version":1}},session=session)
+            if not read_only:
+                self.db.coord.update_one({"_id":"ledger"},{"$inc":{"version":1}},session=session)
             return operation(session)
         with self.client.start_session() as session:
             return session.with_transaction(execute, read_concern=ReadConcern("snapshot"),
@@ -76,10 +78,12 @@ class MongoStore:
             if balance["total"] + reward > 99999999999:
                 raise RuleError("Streak reward ထည့်လျှင် wallet limit ကျော်နိုင်ပါတယ်။")
             self.db.wallets.update_one({"_id":user_id},{"$inc":{"balance":reward}},session=session)
+            # A user can reach the same milestone again after a loss. The ledger
+            # sequence distinguishes rewards; game settlement prevents repayment.
             eid=self._next("wallet_events",session)
             self.db.wallet_events.insert_one(dict(_id=eid,id=eid,user_id=user_id,delta=reward,
                 kind="streak_reward",note=f"{category} {streak}-win streak reward",
-                actor_id=None,auction_id=None,event_key=f"streak:{category}:{group_id}:{user_id}:{streak}",created=now),session=session)
+                actor_id=None,auction_id=None,event_key=f"streak:{category}:{group_id}:{user_id}:{streak}:{eid}",created=now),session=session)
         return {"streak":streak,"reward":reward}
 
     def get(self, key, default="", session=None):
@@ -203,7 +207,7 @@ class MongoStore:
 
     def wallet_balance(self, user_id, session=None):
         if session is None:
-            return self._tx(lambda s:self.wallet_balance(user_id,s))
+            return self._tx(lambda s:self.wallet_balance(user_id,s), read_only=True)
         row=self.db.wallets.find_one({"_id":user_id},session=session)
         total=row["balance"] if row else 0
         held=sum(r["amount"] for r in self.db.holds.find({"user_id":user_id},session=session))
